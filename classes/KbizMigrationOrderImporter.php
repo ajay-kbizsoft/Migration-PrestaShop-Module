@@ -115,6 +115,484 @@ class KbizMigrationOrderImporter
         ];
     }
 
+    public function getInvoiceAndDiscountProgress()
+    {
+        $this->prepareDatabase();
+        $state = $this->getState('order_financials');
+        $total = (int) $state['total_count'];
+        if ($total === 0) {
+            $total = $this->client->countResource('orders');
+            $this->saveTotalCount($total, 'order_financials');
+        }
+
+        return [
+            'last_source_id' => (int) $state['last_source_id'],
+            'done' => (bool) $state['is_complete']
+                && $this->countEntityMappings('order_financials', 'imported') >= $total,
+            'imported' => $this->countEntityMappings('order_invoices', 'imported'),
+            'attached' => $this->countEntityMappings('order_cart_rules', 'imported'),
+            'skipped' => $this->countEntityMappings('order_cart_rules', 'skipped'),
+            'total' => $total,
+            'processed' => min($total, $this->countEntityMappings('order_financials', 'imported')),
+            'remaining' => max(0, $total - $this->countEntityMappings('order_financials', 'imported')),
+        ];
+    }
+
+    public function runNextInvoiceAndDiscountBatch()
+    {
+        $this->prepareDatabase();
+        $entity = 'order_financials';
+        $state = $this->getState($entity);
+        $total = (int) $state['total_count'];
+        if ($total === 0) {
+            $total = $this->client->countResource('orders');
+            $this->saveTotalCount($total, $entity);
+        }
+        if ($total === 0) {
+            $this->saveState(0, true, $entity);
+
+            return [
+                'done' => true,
+                'processed' => 0,
+                'invoices' => 0,
+                'attached' => 0,
+                'skipped' => 0,
+            ];
+        }
+        if ($state['is_complete']) {
+            return [
+                'done' => true,
+                'processed' => 0,
+                'invoices' => $this->countEntityMappings('order_invoices', 'imported'),
+                'attached' => $this->countEntityMappings('order_cart_rules', 'imported'),
+                'skipped' => $this->countEntityMappings('order_cart_rules', 'skipped'),
+            ];
+        }
+
+        $cursor = (int) $state['last_source_id'];
+        $response = $this->client->getResource('orders', [
+            'display' => '[id]',
+            'sort' => '[id_ASC]',
+            'filter' => ['id' => '>[' . $cursor . ']'],
+            'limit' => '0,' . (self::BATCH_SIZE + 1),
+        ]);
+        $items = self::extractItems($response, 'orders', 'order');
+        $hasMore = count($items) > self::BATCH_SIZE;
+        if ($hasMore) {
+            $items = array_slice($items, 0, self::BATCH_SIZE);
+        }
+
+        $processed = 0;
+        foreach ($items as $item) {
+            $sourceOrderId = self::getId($item);
+            if ($sourceOrderId <= $cursor) {
+                throw new RuntimeException('The source order list is not ordered by increasing ID.');
+            }
+            $this->importOrderInvoicesAndDiscounts($sourceOrderId);
+            $cursor = $sourceOrderId;
+            ++$processed;
+        }
+
+        $done = !$hasMore;
+        $this->saveState($cursor, $done, $entity);
+
+        return [
+            'done' => $done,
+            'processed' => $processed,
+            'invoices' => $this->countEntityMappings('order_invoices', 'imported'),
+            'attached' => $this->countEntityMappings('order_cart_rules', 'imported'),
+            'skipped' => $this->countEntityMappings('order_cart_rules', 'skipped'),
+        ];
+    }
+
+    private function importOrderInvoicesAndDiscounts($sourceOrderId)
+    {
+        $progressMapping = $this->getMapping('order_financials', $sourceOrderId);
+        if ($progressMapping && $progressMapping['status'] === 'imported') {
+            return;
+        }
+        $orderMapping = $this->getMapping(self::ENTITY, $sourceOrderId);
+        if (!$orderMapping || $orderMapping['status'] !== 'imported') {
+            throw new RuntimeException(
+                'Import source order ' . (int) $sourceOrderId . ' before migrating its invoices and cart-rule history.'
+            );
+        }
+        $destinationOrder = new Order((int) $orderMapping['destination_id']);
+        if (!Validate::isLoadedObject($destinationOrder)) {
+            throw new RuntimeException(
+                'Destination order mapped from source order ' . (int) $sourceOrderId . ' no longer exists.'
+            );
+        }
+
+        $sourceInvoices = $this->loadRelatedResources(
+            'order_invoices',
+            'order_invoice',
+            $sourceOrderId
+        );
+        $sourceOrderCartRules = $this->loadRelatedResources(
+            'order_cart_rules',
+            'order_cart_rule',
+            $sourceOrderId
+        );
+        $sourceDetails = $this->loadOrderDetails($sourceOrderId);
+        $destinationDetails = $this->loadDestinationOrderDetails((int) $destinationOrder->id);
+        if (count($sourceDetails) !== count($destinationDetails)) {
+            throw new RuntimeException(
+                'Source and destination order ' . (int) $sourceOrderId
+                . ' have different line counts; invoice lines cannot be safely matched.'
+            );
+        }
+
+        if (!Db::getInstance()->execute('START TRANSACTION')) {
+            throw new RuntimeException(
+                'Could not start a transaction for invoice and cart-rule history of source order '
+                . (int) $sourceOrderId . '.'
+            );
+        }
+        try {
+            $invoiceIds = [];
+            $latestInvoice = null;
+            foreach ($sourceInvoices as $sourceInvoiceSummary) {
+                $sourceInvoiceId = self::getId($sourceInvoiceSummary);
+                $sourceInvoice = $this->loadResource(
+                    'order_invoices',
+                    $sourceInvoiceId,
+                    'order_invoice'
+                );
+                if ((int) $sourceInvoice->id_order !== (int) $sourceOrderId) {
+                    throw new RuntimeException(
+                        'Source invoice ' . $sourceInvoiceId . ' does not belong to source order ' . (int) $sourceOrderId . '.'
+                    );
+                }
+                if (!isset($sourceInvoice->number) || (int) $sourceInvoice->number <= 0) {
+                    $invoiceIds[$sourceInvoiceId] = 0;
+                    continue;
+                }
+                $destinationInvoiceId = $this->ensureDestinationInvoice(
+                    $sourceInvoiceId,
+                    $sourceInvoice,
+                    $destinationOrder
+                );
+                $invoiceIds[$sourceInvoiceId] = $destinationInvoiceId;
+                $invoiceDate = $this->sourceDate($sourceInvoice, 'date_add', $this->sourceDate($sourceInvoice, 'delivery_date'));
+                $invoice = new OrderInvoice($destinationInvoiceId);
+                if (
+                    $latestInvoice === null
+                    || strcmp($invoiceDate, $latestInvoice['date_add']) > 0
+                    || (
+                        $invoiceDate === $latestInvoice['date_add']
+                        && (int) $invoice->number > (int) $latestInvoice['number']
+                    )
+                ) {
+                    $latestInvoice = [
+                        'date_add' => $invoiceDate,
+                        'number' => (int) $invoice->number,
+                    ];
+                }
+            }
+
+            $this->mapSourceOrderDetails(
+                $sourceDetails,
+                $destinationDetails,
+                $invoiceIds,
+                (int) $destinationOrder->id
+            );
+            foreach ($sourceOrderCartRules as $sourceOrderCartRule) {
+                $this->importOrderCartRule(
+                    $sourceOrderId,
+                    (int) $destinationOrder->id,
+                    $sourceOrderCartRule,
+                    $invoiceIds
+                );
+            }
+            if ($latestInvoice !== null) {
+                $destinationOrder->invoice_number = $latestInvoice['number'];
+                $destinationOrder->invoice_date = $latestInvoice['date_add'];
+                if (!$destinationOrder->update()) {
+                    throw new RuntimeException(
+                        'Could not update invoice details for destination order ' . (int) $destinationOrder->id . '.'
+                    );
+                }
+            }
+            if (!$this->saveMapping('order_financials', $sourceOrderId, (int) $destinationOrder->id, 'imported')) {
+                throw new RuntimeException('Could not save invoice and discount migration progress for source order.');
+            }
+            if (!Db::getInstance()->execute('COMMIT')) {
+                throw new RuntimeException(
+                    'Could not commit invoice and discount history for source order ' . (int) $sourceOrderId . '.'
+                );
+            }
+        } catch (Throwable $exception) {
+            Db::getInstance()->execute('ROLLBACK');
+            throw $exception;
+        }
+    }
+
+    private function ensureDestinationInvoice($sourceInvoiceId, SimpleXMLElement $source, Order $order)
+    {
+        $mapping = $this->getMapping('order_invoices', $sourceInvoiceId);
+        if ($mapping && Validate::isLoadedObject(new OrderInvoice((int) $mapping['destination_id']))) {
+            $invoice = new OrderInvoice((int) $mapping['destination_id']);
+            if ((int) $invoice->id_order !== (int) $order->id) {
+                throw new RuntimeException('A mapped destination invoice belongs to a different order.');
+            }
+            $invoice->number = (int) $invoice->number;
+        } else {
+            $invoice = new OrderInvoice();
+            $invoice->id_order = (int) $order->id;
+            $invoice->number = 0;
+            $invoice->delivery_number = 0;
+            $invoice->delivery_date = '0000-00-00 00:00:00';
+        }
+
+        $invoice->id_order = (int) $order->id;
+        foreach ([
+            'total_discount_tax_excl',
+            'total_discount_tax_incl',
+            'total_paid_tax_excl',
+            'total_paid_tax_incl',
+            'total_products',
+            'total_products_wt',
+            'total_shipping_tax_excl',
+            'total_shipping_tax_incl',
+            'shipping_tax_computation_method',
+            'total_wrapping_tax_excl',
+            'total_wrapping_tax_incl',
+        ] as $field) {
+            if (isset($source->{$field})) {
+                $invoice->{$field} = (string) $source->{$field};
+            }
+        }
+        $sourceNumber = isset($source->number) ? (int) $source->number : 0;
+        $sourceDate = $this->sourceDate($source, 'date_add', $this->sourceDate($source, 'delivery_date'));
+        $sourceNote = isset($source->note) ? trim(strip_tags((string) $source->note)) : '';
+        $migrationNote = 'Migrated source invoice #' . $sourceNumber;
+        $invoice->note = trim($sourceNote . ($sourceNote !== '' ? "\n" : '') . $migrationNote);
+
+        if (!(int) $invoice->id) {
+            if (!$invoice->add()) {
+                throw new RuntimeException('Could not create a destination invoice for source invoice ' . $sourceInvoiceId . '.');
+            }
+            $invoice->number = $this->nextInvoiceNumber($sourceDate);
+        }
+        $invoice->date_add = $sourceDate;
+        $invoice->delivery_number = 0;
+        $invoice->delivery_date = '0000-00-00 00:00:00';
+        if (!$invoice->update()) {
+            throw new RuntimeException('Could not save destination invoice for source invoice ' . $sourceInvoiceId . '.');
+        }
+        if (!$this->saveMapping('order_invoices', $sourceInvoiceId, (int) $invoice->id, 'imported')) {
+            throw new RuntimeException('Could not save the mapping for source invoice ' . $sourceInvoiceId . '.');
+        }
+
+        return (int) $invoice->id;
+    }
+
+    private function nextInvoiceNumber($invoiceDate)
+    {
+        $sql = 'SELECT MAX(`number`) FROM `' . _DB_PREFIX_ . 'order_invoice`';
+        if (Configuration::get('PS_INVOICE_RESET')) {
+            $sql .= ' WHERE YEAR(`date_add`) = ' . (int) date('Y', strtotime($invoiceDate));
+        }
+        $lastNumber = Db::getInstance()->getValue($sql);
+        if ($lastNumber === false) {
+            throw new RuntimeException('Could not determine the next destination invoice number.');
+        }
+
+        return (int) $lastNumber + 1;
+    }
+
+    private function mapSourceOrderDetails(array $sourceDetails, array $destinationDetails, array $invoiceIds, $destinationOrderId)
+    {
+        foreach ($sourceDetails as $index => $sourceDetail) {
+            $sourceDetailId = self::getId($sourceDetail);
+            if ($sourceDetailId <= 0) {
+                throw new RuntimeException('A source order line has an invalid ID.');
+            }
+            $mapping = $this->getMapping('order_details', $sourceDetailId);
+            $destinationDetail = $mapping
+                ? $this->loadDestinationOrderDetail((int) $mapping['destination_id'])
+                : $destinationDetails[$index];
+            if (
+                !$destinationDetail
+                || (int) $destinationDetail['id_order'] !== (int) $destinationOrderId
+                || (int) $destinationDetail['product_id'] !== $this->mappedDestinationId(
+                    'products',
+                    (int) $sourceDetail->product_id,
+                    'product in source order line'
+                )
+                || (int) $destinationDetail['product_attribute_id'] !== $this->mappedOptionalCombinationId(
+                    isset($sourceDetail->product_attribute_id) ? (int) $sourceDetail->product_attribute_id : 0
+                )
+                || (int) $destinationDetail['product_quantity'] !== (int) $sourceDetail->product_quantity
+            ) {
+                throw new RuntimeException(
+                    'Could not safely match source order line ' . $sourceDetailId . ' to its destination line.'
+                );
+            }
+
+            $destinationInvoiceId = 0;
+            $sourceInvoiceId = isset($sourceDetail->id_order_invoice) ? (int) $sourceDetail->id_order_invoice : 0;
+            if ($sourceInvoiceId > 0) {
+                if (!array_key_exists($sourceInvoiceId, $invoiceIds)) {
+                    throw new RuntimeException(
+                        'Source order line ' . $sourceDetailId . ' references an invoice that was not returned.'
+                    );
+                }
+                $destinationInvoiceId = $invoiceIds[$sourceInvoiceId];
+            }
+            if (!Db::getInstance()->update(
+                'order_detail',
+                ['id_order_invoice' => $destinationInvoiceId],
+                '`id_order_detail` = ' . (int) $destinationDetail['id_order_detail']
+                    . ' AND `id_order` = ' . (int) $destinationOrderId
+            )) {
+                throw new RuntimeException('Could not link a destination order line to its invoice.');
+            }
+            if (!$this->saveMapping(
+                'order_details',
+                $sourceDetailId,
+                (int) $destinationDetail['id_order_detail'],
+                'imported'
+            )) {
+                throw new RuntimeException('Could not save the source order-line mapping.');
+            }
+        }
+    }
+
+    private function mappedOptionalCombinationId($sourceCombinationId)
+    {
+        return $sourceCombinationId > 0
+            ? $this->mappedDestinationId('product_combinations', $sourceCombinationId, 'product combination')
+            : 0;
+    }
+
+    private function loadDestinationOrderDetails($destinationOrderId)
+    {
+        $rows = Db::getInstance()->executeS(
+            'SELECT `id_order_detail`, `id_order`, `product_id`, `product_attribute_id`, `product_quantity`
+            FROM `' . _DB_PREFIX_ . 'order_detail`
+            WHERE `id_order` = ' . (int) $destinationOrderId . '
+            ORDER BY `id_order_detail` ASC'
+        );
+        if ($rows === false) {
+            throw new RuntimeException('Could not read destination order lines for invoice mapping.');
+        }
+
+        return $rows;
+    }
+
+    private function loadDestinationOrderDetail($destinationDetailId)
+    {
+        $row = Db::getInstance()->getRow(
+            'SELECT `id_order_detail`, `id_order`, `product_id`, `product_attribute_id`, `product_quantity`
+            FROM `' . _DB_PREFIX_ . 'order_detail`
+            WHERE `id_order_detail` = ' . (int) $destinationDetailId
+        );
+
+        return $row ?: null;
+    }
+
+    private function importOrderCartRule($sourceOrderId, $destinationOrderId, SimpleXMLElement $source, array $invoiceIds)
+    {
+        $sourceAssociationId = self::getId($source);
+        if ($sourceAssociationId <= 0 || (int) $source->id_order !== (int) $sourceOrderId) {
+            throw new RuntimeException('The source order-cart-rule list contains an invalid association.');
+        }
+        $mapping = $this->getMapping('order_cart_rules', $sourceAssociationId);
+        if ($mapping && in_array($mapping['status'], ['imported', 'skipped'], true)) {
+            return;
+        }
+        $sourceCartRuleId = isset($source->id_cart_rule) ? (int) $source->id_cart_rule : 0;
+        $cartRuleMapping = $this->getMapping('cart_rules', $sourceCartRuleId);
+        if (!$cartRuleMapping) {
+            throw new RuntimeException(
+                'Migrate cart rules before importing order discounts; source cart rule '
+                . (int) $sourceCartRuleId . ' has no migration mapping.'
+            );
+        }
+        if ($cartRuleMapping['status'] !== 'imported') {
+            if (!$this->saveMapping('order_cart_rules', $sourceAssociationId, 0, 'skipped')) {
+                throw new RuntimeException('Could not record an order discount without an imported destination cart rule.');
+            }
+
+            return;
+        }
+        if (!Validate::isLoadedObject(new CartRule((int) $cartRuleMapping['destination_id']))) {
+            throw new RuntimeException(
+                'The destination cart rule mapped from source cart rule ' . $sourceCartRuleId . ' is missing.'
+            );
+        }
+
+        $sourceInvoiceId = isset($source->id_order_invoice) ? (int) $source->id_order_invoice : 0;
+        $destinationInvoiceId = 0;
+        if ($sourceInvoiceId > 0) {
+            if (!array_key_exists($sourceInvoiceId, $invoiceIds)) {
+                $invoiceMapping = $this->getMapping('order_invoices', $sourceInvoiceId);
+                if (!$invoiceMapping || $invoiceMapping['status'] !== 'imported') {
+                    throw new RuntimeException('An order discount references an invoice that has not been migrated.');
+                }
+                $destinationInvoiceId = (int) $invoiceMapping['destination_id'];
+            } else {
+                $destinationInvoiceId = $invoiceIds[$sourceInvoiceId];
+            }
+        }
+
+        $orderCartRule = new OrderCartRule();
+        $orderCartRule->id_order = (int) $destinationOrderId;
+        $orderCartRule->id_cart_rule = (int) $cartRuleMapping['destination_id'];
+        $orderCartRule->id_order_invoice = $destinationInvoiceId;
+        $orderCartRule->name = isset($source->name) ? trim(strip_tags((string) $source->name)) : '';
+        $orderCartRule->value = isset($source->value) ? (float) $source->value : 0;
+        $orderCartRule->value_tax_excl = isset($source->value_tax_excl) ? (float) $source->value_tax_excl : 0;
+        $orderCartRule->free_shipping = isset($source->free_shipping) && (bool) (int) $source->free_shipping;
+        $orderCartRule->deleted = isset($source->deleted) && (bool) (int) $source->deleted;
+        if (!$orderCartRule->add()) {
+            throw new RuntimeException('Could not attach a migrated discount to destination order ' . (int) $destinationOrderId . '.');
+        }
+        if (!$this->saveMapping(
+            'order_cart_rules',
+            $sourceAssociationId,
+            (int) $orderCartRule->id,
+            'imported'
+        )) {
+            throw new RuntimeException('Could not save the source order-discount mapping.');
+        }
+    }
+
+    private function loadRelatedResources($resource, $itemNode, $sourceOrderId)
+    {
+        $items = [];
+        $cursor = 0;
+        for ($page = 0; $page < 10000; ++$page) {
+            $response = $this->client->getResource($resource, [
+                'display' => 'full',
+                'sort' => '[id_ASC]',
+                'filter' => [
+                    'id_order' => '[' . (int) $sourceOrderId . ']',
+                    'id' => '>[' . $cursor . ']',
+                ],
+                'limit' => '0,' . self::PAGE_SIZE,
+            ]);
+            $pageItems = self::extractItems($response, $resource, $itemNode);
+            foreach ($pageItems as $item) {
+                $id = self::getId($item);
+                if ($id <= $cursor || (int) $item->id_order !== (int) $sourceOrderId) {
+                    throw new RuntimeException(
+                        'The source ' . $resource . ' list for order ' . (int) $sourceOrderId . ' is invalid or unordered.'
+                    );
+                }
+                $items[] = $item;
+                $cursor = $id;
+            }
+            if (count($pageItems) < self::PAGE_SIZE) {
+                return $items;
+            }
+        }
+
+        throw new RuntimeException('Could not finish reading source ' . $resource . ' for order ' . (int) $sourceOrderId . '.');
+    }
+
     private function importOrder($sourceOrderId)
     {
         $source = $this->loadResource('orders', $sourceOrderId, 'order');
@@ -680,46 +1158,46 @@ class KbizMigrationOrderImporter
         }
     }
 
-    private function getState()
+    private function getState($entity = self::ENTITY)
     {
         $state = Db::getInstance()->getRow(
             'SELECT `last_source_id`, `is_complete`, `total_count` FROM `' . _DB_PREFIX_ . 'kbizmigration_state`
             WHERE `source_key` = \'' . pSQL($this->sourceKey) . '\'
-                AND `entity` = \'' . self::ENTITY . '\''
+                AND `entity` = \'' . pSQL($entity) . '\''
         );
         if ($state) {
             return $state;
         }
         if (!Db::getInstance()->insert('kbizmigration_state', [
             'source_key' => pSQL($this->sourceKey),
-            'entity' => self::ENTITY,
+            'entity' => pSQL($entity),
             'last_source_id' => 0,
             'is_complete' => 0,
             'total_count' => 0,
             'date_upd' => date('Y-m-d H:i:s'),
         ])) {
-            throw new RuntimeException('Could not create order migration progress.');
+            throw new RuntimeException('Could not create ' . pSQL($entity) . ' migration progress.');
         }
 
         return ['last_source_id' => 0, 'is_complete' => 0, 'total_count' => 0];
     }
 
-    private function saveTotalCount($total)
+    private function saveTotalCount($total, $entity = self::ENTITY)
     {
         $updated = Db::getInstance()->update(
             'kbizmigration_state',
             ['total_count' => (int) $total, 'date_upd' => date('Y-m-d H:i:s')],
-            '`source_key` = \'' . pSQL($this->sourceKey) . '\' AND `entity` = \'' . self::ENTITY . '\''
+            '`source_key` = \'' . pSQL($this->sourceKey) . '\' AND `entity` = \'' . pSQL($entity) . '\''
         );
         if (!$updated && !Db::getInstance()->Affected_Rows()) {
-            $state = $this->getState();
+            $state = $this->getState($entity);
             if ((int) $state['total_count'] !== (int) $total) {
-                throw new RuntimeException('Could not save the source order total.');
+                throw new RuntimeException('Could not save the source ' . pSQL($entity) . ' total.');
             }
         }
     }
 
-    private function saveState($cursor, $done)
+    private function saveState($cursor, $done, $entity = self::ENTITY)
     {
         $updated = Db::getInstance()->update(
             'kbizmigration_state',
@@ -728,12 +1206,12 @@ class KbizMigrationOrderImporter
                 'is_complete' => $done ? 1 : 0,
                 'date_upd' => date('Y-m-d H:i:s'),
             ],
-            '`source_key` = \'' . pSQL($this->sourceKey) . '\' AND `entity` = \'' . self::ENTITY . '\''
+            '`source_key` = \'' . pSQL($this->sourceKey) . '\' AND `entity` = \'' . pSQL($entity) . '\''
         );
         if (!$updated && !Db::getInstance()->Affected_Rows()) {
-            $state = $this->getState();
+            $state = $this->getState($entity);
             if ((int) $state['last_source_id'] !== (int) $cursor || (bool) $state['is_complete'] !== (bool) $done) {
-                throw new RuntimeException('Could not save order migration progress.');
+                throw new RuntimeException('Could not save ' . pSQL($entity) . ' migration progress.');
             }
         }
     }
@@ -744,6 +1222,16 @@ class KbizMigrationOrderImporter
             'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'kbizmigration_map`
             WHERE `source_key` = \'' . pSQL($this->sourceKey) . '\'
                 AND `entity` = \'' . self::ENTITY . '\'
+                AND `status` = \'' . pSQL($status) . '\''
+        );
+    }
+
+    private function countEntityMappings($entity, $status)
+    {
+        return (int) Db::getInstance()->getValue(
+            'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'kbizmigration_map`
+            WHERE `source_key` = \'' . pSQL($this->sourceKey) . '\'
+                AND `entity` = \'' . pSQL($entity) . '\'
                 AND `status` = \'' . pSQL($status) . '\''
         );
     }

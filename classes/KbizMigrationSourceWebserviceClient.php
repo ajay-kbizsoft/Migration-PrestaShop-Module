@@ -301,6 +301,8 @@ class KbizMigrationSourceWebserviceClient
                 'orders',
                 'order_details',
                 'order_histories',
+                'order_invoices',
+                'order_cart_rules',
                 'order_states',
                 'cart_rules',
                 'currencies',

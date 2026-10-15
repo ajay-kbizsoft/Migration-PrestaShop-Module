@@ -30,8 +30,9 @@ migrated in resumable batches.
    importer reads categories, products, combinations, product options, product
    option values, stock availables, and languages. Customer migration reads
    customers, addresses, countries, and states. Order migration reads orders,
-   order details, order histories, order states, currencies, and languages.
-   Cart-rule migration reads cart rules, currencies, and languages.
+   order details, order histories, order invoices, order-cart rules, order
+   states, currencies, and languages. Cart-rule migration reads cart rules,
+   currencies, and languages.
    Grant read-only (`GET`) access for resources used in each stage.
 4. Copy the source store's base URL and API key into the module configuration on
    the destination store, then select **Test connection**.
@@ -44,8 +45,9 @@ rejected; enter the final HTTPS host directly in that case.
 After testing the connection, use **Check migration permissions** to verify
 GET access for categories, products, combinations, product options, product
 option values, stock availables, customers, addresses, countries, states,
-orders, order details, order histories, order states, cart rules, currencies,
-and languages. This preflight does not import or modify any store data.
+orders, order details, order histories, order invoices, order-cart rules, order
+states, cart rules, currencies, and languages. This preflight does not import
+or modify any store data.
 
 Use **Preview and compare categories** to see the total source category count,
 the matched/new totals, and a paginated list of source categories compared with
@@ -116,15 +118,28 @@ Order lines, source references, payment-method description, totals, and order
 status history are copied. Destination orders use the destination shop's
 customer, address, currency, and product IDs. The importer does not create
 payment records, capture or refund money, transfer payment credentials, create
-invoices or shipping labels, or send order emails/status notifications.
+shipping labels, or send order emails/status notifications.
 The source payment-method description is saved in the destination order note.
-No source carrier is assigned to the destination order. Historical invoice and
-delivery numbers are not recreated. An order and its
-lines/history are written transactionally, and source-to-destination mappings
-make retries safe.
+No source carrier is assigned to the destination order. The main order batch
+does not create invoice records or delivery numbers. An order and its lines/
+history are written transactionally, and source-to-destination mappings make
+retries safe.
 Historical line tax names and rates are retained, but source tax-ID
 associations are not recreated; destination order lines use the mapped
 product's local tax rule group.
+
+The **Order invoices and discount history** panel appears under the **Orders**
+tab. After orders and cart rules are migrated, it processes three source orders
+at a time, creates historical invoice records, links order lines and migrated
+cart-rule uses to their corresponding destination invoices, and updates the
+order's invoice summary. Invoice totals and dates are copied without currency
+conversion. To avoid collisions with destination invoices, each imported
+invoice receives a new destination number; the source invoice number is saved
+in its note. Source shop identity is not copied: invoice PDFs use the
+destination shop address. Invoice tax-ID associations, payment history,
+delivery slips, and delivery numbers are not recreated. Cart-rule uses are
+attached only when their source rule has an imported destination mapping;
+rules skipped during cart-rule migration are not attached.
 
 The **Cart rules** tab imports voucher-code rules five at a time. It copies
 translated names, validity dates, quantities, minimum amounts, discounts, free
@@ -174,8 +189,9 @@ credentials, or data mappings into the module source code.
   addresses in resumable batches, matching destination countries/states by ISO
   code and tracking mappings separately.
 - `classes/KbizMigrationOrderImporter.php` imports orders, mapped order lines,
-  and status history in resumable, transactional batches without invoking
-  payment or notification workflows.
+  status history, invoice records, and mapped order-cart-rule history in
+  resumable, transactional batches without invoking payment or notification
+  workflows.
 - `classes/KbizMigrationCartRuleImporter.php` imports supported voucher-code
   cart rules in resumable batches and skips rules whose eligibility
   restrictions cannot be safely mapped.

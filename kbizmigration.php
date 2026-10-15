@@ -20,7 +20,7 @@ class Kbizmigration extends Module
     {
         $this->name = 'kbizmigration';
         $this->tab = 'administration';
-        $this->version = '1.8.0';
+        $this->version = '1.9.0';
         $this->author = 'Kbizsoft';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -60,6 +60,7 @@ class Kbizmigration extends Module
         $productProgress = null;
         $customerProgress = null;
         $orderProgress = null;
+        $orderFinancialProgress = null;
         $cartRuleProgress = null;
         $requestedTab = Tools::getValue('active_tab', 'categories');
         $activeTab = is_string($requestedTab) ? $requestedTab : 'categories';
@@ -471,6 +472,56 @@ class Kbizmigration extends Module
                     );
                 }
             }
+        } elseif (Tools::isSubmit('submitKbizMigrationOrderFinancials')) {
+            if ($sourceUrl === '' || $apiKey === '') {
+                $output .= $this->displayError(
+                    $this->trans('Save the source URL and Webservice API key before migrating order invoices and discount history.', [], 'Modules.Kbizmigration.Admin')
+                );
+            } else {
+                try {
+                    $client = new KbizMigrationSourceWebserviceClient($sourceUrl, $apiKey);
+                    $client->testConnection();
+                    $requiredResources = ['orders', 'order_details', 'order_invoices', 'order_cart_rules'];
+                    $access = $client->checkReadAccess($requiredResources);
+                    $missingResources = [];
+                    foreach ($requiredResources as $resource) {
+                        if (empty($access[$resource])) {
+                            $missingResources[] = $resource;
+                        }
+                    }
+                    if ($missingResources) {
+                        $output .= $this->displayError(sprintf(
+                            $this->trans(
+                                'Order invoice and discount-history migration requires GET permission for these source Webservice resources: %s.',
+                                [],
+                                'Modules.Kbizmigration.Admin'
+                            ),
+                            htmlspecialchars(implode(', ', $missingResources), ENT_QUOTES, 'UTF-8')
+                        ));
+                    } else {
+                        $importer = new KbizMigrationOrderImporter($client, $sourceUrl);
+                        $result = $importer->runNextInvoiceAndDiscountBatch();
+                        $output .= $this->displayConfirmation(sprintf(
+                            $this->trans(
+                                'Order history batch complete: %1$d orders processed, %2$d invoices migrated, %3$d discounts attached, and %4$d discounts skipped. %5$s',
+                                [],
+                                'Modules.Kbizmigration.Admin'
+                            ),
+                            $result['processed'],
+                            $result['invoices'],
+                            $result['attached'],
+                            $result['skipped'],
+                            $result['done']
+                                ? $this->trans('Order invoice and discount history migration is complete.', [], 'Modules.Kbizmigration.Admin')
+                                : $this->trans('Select the button again to continue with the next batch.', [], 'Modules.Kbizmigration.Admin')
+                        ));
+                    }
+                } catch (Throwable $exception) {
+                    $output .= $this->displayError(
+                        $this->trans($exception->getMessage(), [], 'Modules.Kbizmigration.Admin')
+                    );
+                }
+            }
         }
 
         $output .= $this->renderSettingsForm($sourceUrl, $apiKey !== '');
@@ -500,6 +551,14 @@ class Kbizmigration extends Module
                 }
                 try {
                     $orderProgress = (new KbizMigrationOrderImporter($client, $sourceUrl))->getProgress();
+                } catch (Exception $exception) {
+                    $output .= $this->displayError(
+                        $this->trans($exception->getMessage(), [], 'Modules.Kbizmigration.Admin')
+                    );
+                }
+                try {
+                    $orderFinancialProgress = (new KbizMigrationOrderImporter($client, $sourceUrl))
+                        ->getInvoiceAndDiscountProgress();
                 } catch (Exception $exception) {
                     $output .= $this->displayError(
                         $this->trans($exception->getMessage(), [], 'Modules.Kbizmigration.Admin')
@@ -578,7 +637,11 @@ class Kbizmigration extends Module
         if ($orderProgress !== null) {
             $output .= $this->renderOrderProgress($orderProgress);
         }
-        $output .= $this->renderOrderMigrationForm($sourceUrl !== '' && $apiKey !== '')
+        $output .= $this->renderOrderMigrationForm($sourceUrl !== '' && $apiKey !== '');
+        if ($orderFinancialProgress !== null) {
+            $output .= $this->renderOrderFinancialProgress($orderFinancialProgress);
+        }
+        $output .= $this->renderOrderFinancialForm($sourceUrl !== '' && $apiKey !== '')
             . '</div><div role="tabpanel" class="tab-pane'
             . ($activeTab === 'cart_rules' ? ' active' : '') . '" id="kbiz-cart-rules">';
         if ($cartRuleProgress !== null) {
@@ -809,7 +872,7 @@ class Kbizmigration extends Module
                             $this->trans('Import orders in batches of 3 after customer and product migration. Order lines use the customer, address, product, and combination mappings saved by this module. Source currencies must also be enabled in the destination; totals are copied without currency conversion.', [], 'Modules.Kbizmigration.Admin') .
                         '</p>
                         <p>' .
-                            $this->trans('Order statuses are matched by translated status name. Source payment-method text, reference, totals, and status history are retained, but payment records, credentials, capture/refund actions, invoices, and shipping labels are not created. No order emails or status-change notifications are sent.', [], 'Modules.Kbizmigration.Admin') .
+                            $this->trans('Order statuses are matched by translated status name. Source payment-method text, reference, totals, and status history are retained, but payment records, credentials, capture/refund actions, invoice records, and shipping labels are not created in this batch. Use the invoice and discount-history panel below to migrate eligible historical invoice records later. No order emails or status-change notifications are sent.', [], 'Modules.Kbizmigration.Admin') .
                         '</p>
                     </div>
                     <div class="panel-footer">
@@ -861,6 +924,49 @@ class Kbizmigration extends Module
                     </div>
                 </div>
             </form>';
+    }
+
+    private function renderOrderFinancialForm($isConfigured)
+    {
+        if (!$isConfigured) {
+            return '';
+        }
+        $action = $this->context->link->getAdminLink('AdminModules', true, [], ['configure' => $this->name]);
+        $escapedAction = htmlspecialchars($action, ENT_QUOTES, 'UTF-8');
+
+        return '
+            <form method="post" action="' . $escapedAction . '" class="form-horizontal">
+                <input type="hidden" name="active_tab" value="orders">
+                <div class="panel">
+                    <div class="panel-heading">'
+                        . $this->trans('Order invoices and discount history', [], 'Modules.Kbizmigration.Admin') .
+                    '</div>
+                    <div class="panel-body">
+                        <p>'
+                            . $this->trans('After order and cart-rule migration, import historical invoice records and attach mapped cart rules to their orders in batches of 3. Invoice amounts and dates are copied; destination invoice numbers are newly assigned to avoid collisions, and each source invoice number is retained in the destination invoice note.', [], 'Modules.Kbizmigration.Admin') .
+                        '</p>
+                        <p>'
+                            . $this->trans('Discount associations whose source cart rule was not imported are skipped. Payment history, invoice tax-ID associations, delivery slips, and delivery numbers are not created. This does not run payment, email, or order-state workflows.', [], 'Modules.Kbizmigration.Admin') .
+                        '</p>
+                    </div>
+                    <div class="panel-footer">
+                        <button type="submit" name="submitKbizMigrationOrderFinancials" class="btn btn-primary">
+                            <i class="process-icon-import"></i> ' . $this->trans('Import next invoice and discount-history batch', [], 'Modules.Kbizmigration.Admin') . '
+                        </button>
+                    </div>
+                </div>
+            </form>';
+    }
+
+    private function renderOrderFinancialProgress(array $progress)
+    {
+        return $this->renderImportProgress(
+            $this->trans('Order invoice and discount-history progress', [], 'Modules.Kbizmigration.Admin'),
+            $progress
+        ) . '<p>' . (int) $progress['imported'] . ' invoices migrated, '
+            . (int) $progress['attached'] . ' discounts attached, '
+            . (int) $progress['skipped'] . ' discounts skipped; source order ID cursor '
+            . (int) $progress['last_source_id'] . '.</p>';
     }
 
     private function renderCartRuleProgress(array $progress)
